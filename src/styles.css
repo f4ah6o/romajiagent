@@ -1,0 +1,163 @@
+:root {
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: #202124;
+  background: #f5f7f8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  min-height: 100vh;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 1px solid #c9d1d8;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1b1f23;
+  min-height: 34px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #7d8b98;
+}
+
+button:disabled {
+  color: #8b949e;
+  cursor: wait;
+}
+
+.shell {
+  width: 100%;
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 12px;
+  padding: 14px;
+}
+
+.topbar,
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.2;
+  font-weight: 700;
+}
+
+p {
+  margin: 3px 0 0;
+  color: #5f6b76;
+  font-size: 12px;
+}
+
+.panes {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(104px, 1fr) auto minmax(72px, 0.7fr) minmax(96px, 0.9fr);
+  gap: 8px;
+}
+
+.pane {
+  min-height: 0;
+  border: 1px solid #d7dde3;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.pane > span,
+.pane-head {
+  min-height: 32px;
+  padding: 7px 10px;
+  color: #53606b;
+  font-size: 12px;
+  font-weight: 650;
+  border-bottom: 1px solid #edf0f2;
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pane-head button {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.input-pane {
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+textarea {
+  width: 100%;
+  height: 100%;
+  resize: none;
+  border: 0;
+  outline: none;
+  padding: 10px;
+  color: #1b1f23;
+  line-height: 1.45;
+}
+
+#convert {
+  width: 100%;
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+output {
+  display: block;
+  white-space: pre-wrap;
+  padding: 10px;
+  line-height: 1.45;
+}
+
+.result.selected {
+  border-color: #1f6feb;
+  box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.16);
+}
+
+footer {
+  min-height: 24px;
+  color: #5f6b76;
+  font-size: 12px;
+}
+
+#mode {
+  color: #1f6feb;
+  font-weight: 700;
+}
