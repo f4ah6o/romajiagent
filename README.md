@@ -78,3 +78,39 @@ pnpm lint
 pnpm format
 cd src-tauri && cargo test
 ```
+
+## Ubuntu 24.04 Debian Package
+
+The Ubuntu package target is tested for Ubuntu 24.04 x86_64 on an X11 session.
+Runtime paste support uses `xdotool`, which is declared as a Debian package
+dependency.
+
+Install build dependencies:
+
+```bash
+just ubuntu-deps
+```
+
+Build the `.deb` package:
+
+```bash
+just deb
+```
+
+The package is written to:
+
+```text
+src-tauri/target/release/bundle/deb/
+```
+
+Install the generated package with apt so package dependencies are resolved:
+
+```bash
+just install-deb
+```
+
+To install Ubuntu dependencies and build the package in one step:
+
+```bash
+just ubuntu-deb
+```
