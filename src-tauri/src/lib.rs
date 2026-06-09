@@ -1,19 +1,23 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::PathBuf,
     process::{Command, ExitStatus, Stdio},
     time::Instant,
 };
 
-use arboard::Clipboard;
 use anyhow::anyhow;
-use chrono::{DateTime, Utc};
+use arboard::Clipboard;
+use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
+
+pub mod protocol;
+
+use protocol::{TransformContext, TransformRequest, TransformResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppConfig {
@@ -34,29 +38,6 @@ impl Default for AppConfig {
             model_path: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransformContext {
-    timestamp: DateTime<Utc>,
-    os: String,
-    app_name: Option<String>,
-    process_id: Option<u32>,
-    window_title: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransformRequest {
-    raw: String,
-    memory: String,
-    context: TransformContext,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransformResponse {
-    converted: String,
-    refined: String,
-    confidence: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +185,20 @@ fn fallback_convert(raw: &str, memory: &str) -> TransformResponse {
     }
 }
 
+fn sidecar_args(config: &AppConfig) -> Vec<String> {
+    let mut args = config.sidecar_args.clone();
+    let has_model_arg = args
+        .iter()
+        .any(|arg| arg == "--model" || arg.starts_with("--model="));
+    if !has_model_arg {
+        if let Some(model_path) = config.model_path.as_ref().filter(|path| !path.is_empty()) {
+            args.push("--model".into());
+            args.push(model_path.clone());
+        }
+    }
+    args
+}
+
 fn infer_with_sidecar(
     config: &AppConfig,
     request: &TransformRequest,
@@ -213,9 +208,10 @@ fn infer_with_sidecar(
     };
 
     let mut child = Command::new(command)
-        .args(&config.sidecar_args)
+        .args(sidecar_args(config))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start sidecar: {e}"))?;
 
@@ -227,17 +223,23 @@ fn infer_with_sidecar(
     writeln!(stdin, "{payload}").map_err(|e| e.to_string())?;
     drop(stdin);
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to open sidecar stdout".to_string())?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    let status = child.wait().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("sidecar exited with {status}"));
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        let stderr_text = stderr_text.trim();
+        if stderr_text.is_empty() {
+            return Err(format!("sidecar exited with {}", output.status));
+        }
+        return Err(format!(
+            "sidecar exited with {}: {stderr_text}",
+            output.status
+        ));
     }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .next()
+        .ok_or_else(|| "sidecar produced no stdout".to_string())?;
     serde_json::from_str(line.trim()).map_err(|e| format!("invalid sidecar json: {e}"))
 }
 
@@ -308,7 +310,10 @@ fn paste_active_app() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let status = Command::new("osascript")
-            .args(["-e", "tell application \"System Events\" to keystroke \"v\" using command down"])
+            .args([
+                "-e",
+                "tell application \"System Events\" to keystroke \"v\" using command down",
+            ])
             .status()
             .map_err(|e| e.to_string())?;
         return ensure_command_succeeded(status, "paste command");
@@ -364,8 +369,8 @@ fn transform_text(raw: String) -> Result<TransformResult, String> {
     };
 
     let infer_started = Instant::now();
-    let response =
-        infer_with_sidecar(&config, &request).unwrap_or_else(|_| fallback_convert(&normalized, &memory));
+    let response = infer_with_sidecar(&config, &request)
+        .unwrap_or_else(|_| fallback_convert(&normalized, &memory));
     let infer_ms = infer_started.elapsed().as_millis();
 
     let result = TransformResult {
@@ -464,7 +469,10 @@ mod tests {
 
     #[test]
     fn normalize_collapses_whitespace() {
-        assert_eq!(normalize("  kyou   mtg\tde\nhanasita todo  "), "kyou mtg de hanasita todo");
+        assert_eq!(
+            normalize("  kyou   mtg\tde\nhanasita todo  "),
+            "kyou mtg de hanasita todo"
+        );
     }
 
     #[test]
@@ -489,6 +497,34 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_args_adds_model_path_when_missing() {
+        let config = AppConfig {
+            sidecar_args: vec!["--max-tokens".into(), "64".into()],
+            model_path: Some("/models/lfm.gguf".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sidecar_args(&config),
+            vec!["--max-tokens", "64", "--model", "/models/lfm.gguf"]
+        );
+    }
+
+    #[test]
+    fn sidecar_args_does_not_duplicate_explicit_model() {
+        let config = AppConfig {
+            sidecar_args: vec!["--model".into(), "/explicit/model.gguf".into()],
+            model_path: Some("/config/model.gguf".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sidecar_args(&config),
+            vec!["--model", "/explicit/model.gguf"]
+        );
+    }
+
+    #[test]
     fn db_schema_initializes() {
         let temp = std::env::temp_dir().join(format!("romajiagent-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&temp).unwrap();
@@ -500,11 +536,30 @@ mod tests {
     #[test]
     fn ensure_command_succeeded_reports_failure() {
         #[cfg(windows)]
-        let status = Command::new("cmd").args(["/C", "exit", "7"]).status().unwrap();
+        let status = Command::new("cmd")
+            .args(["/C", "exit", "7"])
+            .status()
+            .unwrap();
         #[cfg(not(windows))]
         let status = Command::new("sh").args(["-c", "exit 7"]).status().unwrap();
 
         let error = ensure_command_succeeded(status, "paste command").unwrap_err();
         assert!(error.contains("paste command exited with"));
+    }
+
+    #[test]
+    #[ignore = "loads the configured local GGUF model and writes to ~/.romaji-agent"]
+    fn e2e_configured_sidecar_transform() {
+        let result = transform_text("kyou mtg de hanasita todo".into()).unwrap();
+
+        assert_eq!(result.raw, "kyou mtg de hanasita todo");
+        assert!(!result.converted.trim().is_empty());
+        assert!(!result.refined.trim().is_empty());
+        assert!(
+            result.confidence > 0.25,
+            "expected configured sidecar, got fallback-like confidence {} with refined {:?}",
+            result.confidence,
+            result.refined
+        );
     }
 }

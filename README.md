@@ -33,9 +33,12 @@ Configure the sidecar in `~/.romaji-agent/config.toml`:
 
 ```toml
 sidecar_command = "/path/to/romaji-agent-lfm-sidecar"
-sidecar_args = []
+sidecar_args = ["--max-tokens", "256", "--temperature", "0.1"]
 model_path = "/path/to/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf"
 ```
+
+`model_path` is passed to the sidecar as `--model` unless `sidecar_args`
+already contains `--model` or `--model=...`.
 
 The app sends one JSON request line:
 
@@ -64,6 +67,20 @@ The sidecar must print one JSON response line:
 ```
 
 Use 1Password Developer Environments or another runtime injection mechanism for any model registry tokens. Do not put secrets in `config.toml`.
+
+Build the Rust GGUF sidecar:
+
+```bash
+cd src-tauri
+cargo build --bin romaji-agent-lfm-sidecar --release
+```
+
+Run it directly for a contract smoke test:
+
+```bash
+printf '%s\n' '{"raw":"kyou mtg de hanasita todo","memory":"mtg -> ミーティング","context":{"timestamp":"2026-06-08T00:00:00Z","os":"macos","app_name":null,"process_id":null,"window_title":null}}' \
+  | ./target/release/romaji-agent-lfm-sidecar --model /path/to/model.gguf
+```
 
 ## Development
 

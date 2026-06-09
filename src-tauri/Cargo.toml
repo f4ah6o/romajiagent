@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+default-run = "romajiagent"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,6 +14,10 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "romajiagent_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "romaji-agent-lfm-sidecar"
+path = "src/bin/romaji-agent-lfm-sidecar.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -30,3 +35,10 @@ dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
+encoding_rs = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "0.1.146", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2 = "0.1.146"
