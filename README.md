@@ -114,3 +114,36 @@ To install Ubuntu dependencies and build the package in one step:
 ```bash
 just ubuntu-deb
 ```
+
+## Windows Build And Distribution
+
+Windows is supported as a Tauri desktop target with `Ctrl+Shift+J` as the default global shortcut.
+
+### Prerequisites
+
+- Node.js and `pnpm`
+- Rust toolchain
+- Microsoft C++ Build Tools
+- WebView2 runtime
+
+### Build
+
+From PowerShell:
+
+```powershell
+pnpm install
+pnpm build
+pnpm tauri build
+```
+
+The main Windows installer artifact is the generated MSI under:
+
+```text
+src-tauri\target\release\bundle\msi\
+```
+
+### Paste Behavior On Windows
+
+- Accept always writes the selected result to the clipboard first.
+- Automatic paste is best-effort and uses Windows `SendKeys`.
+- If auto-paste does not reach the previously active app, the text is still copied and can be pasted manually with `Ctrl+V`.

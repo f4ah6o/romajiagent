@@ -2,7 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::Instant,
 };
 
@@ -69,6 +69,13 @@ struct TransformResult {
     confidence: f32,
     timings_ms: StageTimings,
     context: TransformContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcceptOutcome {
+    clipboard_updated: bool,
+    pasted: bool,
+    paste_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -289,32 +296,40 @@ fn get_clipboard() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+fn ensure_command_succeeded(status: ExitStatus, action: &str) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{action} exited with {status}"))
+    }
+}
+
 fn paste_active_app() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        Command::new("osascript")
+        let status = Command::new("osascript")
             .args(["-e", "tell application \"System Events\" to keystroke \"v\" using command down"])
             .status()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        return ensure_command_succeeded(status, "paste command");
     }
 
     #[cfg(target_os = "windows")]
     {
-        Command::new("powershell")
+        let status = Command::new("powershell")
             .args(["-NoProfile", "-Command", "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"])
             .status()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        return ensure_command_succeeded(status, "paste command");
     }
 
     #[cfg(target_os = "linux")]
     {
-        Command::new("sh")
+        let status = Command::new("sh")
             .args(["-c", "command -v xdotool >/dev/null && xdotool key ctrl+v"])
             .status()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        return ensure_command_succeeded(status, "paste command");
     }
 }
 
@@ -372,16 +387,26 @@ fn transform_text(raw: String) -> Result<TransformResult, String> {
 }
 
 #[tauri::command]
-fn accept_transform(result: TransformResult, final_text: String, paste: bool) -> Result<(), String> {
+fn accept_transform(
+    result: TransformResult,
+    final_text: String,
+    paste: bool,
+) -> Result<AcceptOutcome, String> {
     let base = ensure_layout()?;
     let mut accepted = result;
     accepted.final_text = final_text.clone();
     save_transform(&base, &accepted, true)?;
     set_clipboard(&final_text)?;
-    if paste {
-        paste_active_app()?;
-    }
-    Ok(())
+    let paste_error = if paste {
+        paste_active_app().err()
+    } else {
+        None
+    };
+    Ok(AcceptOutcome {
+        clipboard_updated: true,
+        pasted: paste && paste_error.is_none(),
+        paste_error,
+    })
 }
 
 #[tauri::command]
@@ -470,5 +495,16 @@ mod tests {
         init_db(&temp).unwrap();
         assert!(temp.join("db.sqlite").exists());
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn ensure_command_succeeded_reports_failure() {
+        #[cfg(windows)]
+        let status = Command::new("cmd").args(["/C", "exit", "7"]).status().unwrap();
+        #[cfg(not(windows))]
+        let status = Command::new("sh").args(["-c", "exit 7"]).status().unwrap();
+
+        let error = ensure_command_succeeded(status, "paste command").unwrap_err();
+        assert!(error.contains("paste command exited with"));
     }
 }
