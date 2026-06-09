@@ -16,6 +16,12 @@ type TransformResult = {
   };
 };
 
+type AcceptOutcome = {
+  clipboard_updated: boolean;
+  pasted: boolean;
+  paste_error: string | null;
+};
+
 type OutputMode = "raw" | "converted" | "refined";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -94,6 +100,10 @@ function selectedText() {
   return result.refined;
 }
 
+function pasteShortcutLabel() {
+  return navigator.platform.toLowerCase().includes("mac") ? "Cmd+V" : "Ctrl+V";
+}
+
 async function convertFromInput() {
   const input = raw.value.trim();
   if (!input || converting) return;
@@ -122,31 +132,41 @@ async function accept(paste: boolean) {
   }
   if (!result) return;
 
+  const activeResult = result;
   const finalText = selectedText();
   setStatus("Accepting");
   try {
-    await invoke("accept_transform", {
-      result,
+    const outcome = await invoke<AcceptOutcome>("accept_transform", {
+      result: activeResult,
       finalText,
       paste,
     });
-    setStatus(paste ? "Inserted" : "Copied");
+    if (outcome.pasted) {
+      setStatus("Inserted");
+      return;
+    }
+    setStatus(
+      paste && outcome.clipboard_updated
+        ? `Copied. Press ${pasteShortcutLabel()} if paste did not happen.`
+        : "Copied",
+    );
   } catch (error) {
-    setStatus(`Copied, paste failed: ${String(error)}`);
+    setStatus(`Accept failed: ${String(error)}`);
   }
 }
 
 async function transformSelection() {
   setStatus("Reading clipboard");
   try {
-    result = await invoke<TransformResult>("transform_clipboard_selection");
-    raw.value = result.raw;
-    converted.textContent = result.converted;
-    refined.textContent = result.refined;
-    timing.textContent = `${result.timings_ms.full_roundtrip}ms`;
+    const nextResult = await invoke<TransformResult>("transform_clipboard_selection");
+    result = nextResult;
+    raw.value = nextResult.raw;
+    converted.textContent = nextResult.converted;
+    refined.textContent = nextResult.refined;
+    timing.textContent = `${nextResult.timings_ms.full_roundtrip}ms`;
     setMode("refined");
     setStatus("Selection preview");
-  } catch (error) {
+  } catch (error: unknown) {
     setStatus(String(error));
   }
 }
@@ -187,4 +207,4 @@ listen("romaji-shortcut", () => {
   setStatus("Ready");
 });
 
-invoke("app_paths").catch((error) => setStatus(String(error)));
+invoke("app_paths").catch((error: unknown) => setStatus(String(error)));
