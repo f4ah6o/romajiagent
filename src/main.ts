@@ -100,6 +100,10 @@ function selectedText() {
   return result.refined;
 }
 
+function pasteShortcutLabel() {
+  return navigator.platform.toLowerCase().includes("mac") ? "Cmd+V" : "Ctrl+V";
+}
+
 async function convertFromInput() {
   const input = raw.value.trim();
   if (!input || converting) return;
@@ -141,11 +145,11 @@ async function accept(paste: boolean) {
       setStatus("Inserted");
       return;
     }
-    if (outcome.clipboard_updated) {
-      setStatus(paste ? "Copied. Press Ctrl+V if paste did not happen." : "Copied");
-      return;
-    }
-    setStatus("Accept failed");
+    setStatus(
+      paste && outcome.clipboard_updated
+        ? `Copied. Press ${pasteShortcutLabel()} if paste did not happen.`
+        : "Copied",
+    );
   } catch (error) {
     setStatus(`Accept failed: ${String(error)}`);
   }
