@@ -1,9 +1,11 @@
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Command, ExitStatus, Stdio},
-    time::Instant,
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
@@ -11,6 +13,7 @@ use arboard::Clipboard;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
@@ -20,22 +23,50 @@ pub mod protocol;
 use protocol::{TransformContext, TransformRequest, TransformResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct AppConfig {
+    backend: String,
     shortcut_macos: String,
     shortcut_other: String,
     sidecar_command: Option<String>,
     sidecar_args: Vec<String>,
     model_path: Option<String>,
+    codex_command: String,
+    codex_args: Vec<String>,
+    codex_model: Option<String>,
+    codex_timeout_ms: u64,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            backend: "sidecar".into(),
             shortcut_macos: "Cmd+Shift+J".into(),
             shortcut_other: "Ctrl+Shift+J".into(),
             sidecar_command: None,
             sidecar_args: vec![],
             model_path: None,
+            codex_command: "codex".into(),
+            codex_args: vec!["app-server".into()],
+            codex_model: None,
+            codex_timeout_ms: 90_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Sidecar,
+    CodexAppServer,
+    Fallback,
+}
+
+impl Backend {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex_app_server" | "codex-app-server" | "codex" => Self::CodexAppServer,
+            "fallback" => Self::Fallback,
+            _ => Self::Sidecar,
         }
     }
 }
@@ -243,6 +274,342 @@ fn infer_with_sidecar(
     serde_json::from_str(line.trim()).map_err(|e| format!("invalid sidecar json: {e}"))
 }
 
+fn codex_prompt(request: &TransformRequest) -> String {
+    format!(
+        r#"Convert the following romaji, typo-heavy, or unconverted Japanese draft into natural Japanese.
+
+Rules:
+- Return only one JSON object matching this schema: {{"converted": string, "refined": string, "confidence": number}}.
+- Do not use tools, shell commands, file reads, or network browsing.
+- Preserve intended meaning. Use memory terms when they clearly apply.
+- "converted" may be a direct conversion. "refined" should be natural, polished Japanese.
+- "confidence" must be between 0 and 1.
+
+Raw:
+{raw}
+
+Memory:
+{memory}
+"#,
+        raw = request.raw,
+        memory = request.memory
+    )
+}
+
+fn transform_response_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["converted", "refined", "confidence"],
+        "properties": {
+            "converted": { "type": "string" },
+            "refined": { "type": "string" },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
+            }
+        }
+    })
+}
+
+struct ChildCleanup {
+    child: Option<Child>,
+}
+
+impl ChildCleanup {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Child, String> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| "child process is already cleaned up".to_string())
+    }
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn write_json_rpc_line(stdin: &mut impl Write, value: &Value) -> Result<(), String> {
+    writeln!(stdin, "{value}").map_err(|e| e.to_string())
+}
+
+fn start_stdout_reader(stdout: impl std::io::Read + Send + 'static) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn recv_json_until(
+    rx: &Receiver<String>,
+    deadline: Instant,
+    stdin: &mut impl Write,
+    expected_id: u64,
+) -> Result<Value, String> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("codex app-server timed out".into());
+        }
+
+        let line = rx
+            .recv_timeout(deadline.saturating_duration_since(now))
+            .map_err(|_| "codex app-server timed out".to_string())?;
+        let value: Value =
+            serde_json::from_str(&line).map_err(|e| format!("invalid app-server json: {e}"))?;
+
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            if let Some(error) = value.get("error") {
+                return Err(format!("codex app-server error: {error}"));
+            }
+            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+        }
+
+        reject_server_request(stdin, &value)?;
+    }
+}
+
+fn reject_server_request(stdin: &mut impl Write, value: &Value) -> Result<(), String> {
+    if value.get("method").and_then(Value::as_str).is_some() && value.get("id").is_some() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": value.get("id").cloned().unwrap_or(Value::Null),
+            "error": {
+                "code": -32601,
+                "message": "Romaji Agent does not allow app-server initiated actions"
+            }
+        });
+        write_json_rpc_line(stdin, &response)?;
+    }
+    Ok(())
+}
+
+fn text_from_codex_notification(
+    value: &Value,
+    turn_id: &str,
+    accumulated: &mut String,
+) -> Option<String> {
+    let method = value.get("method").and_then(Value::as_str)?;
+    let params = value.get("params")?;
+    match method {
+        "item/agentMessage/delta"
+            if params.get("turnId").and_then(Value::as_str) == Some(turn_id) =>
+        {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                accumulated.push_str(delta);
+            }
+            None
+        }
+        "item/completed" if params.get("turnId").and_then(Value::as_str) == Some(turn_id) => {
+            let item = params.get("item")?;
+            if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                item.get("text").and_then(Value::as_str).map(str::to_string)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn wait_for_codex_turn(
+    rx: &Receiver<String>,
+    deadline: Instant,
+    stdin: &mut impl Write,
+    turn_id: &str,
+) -> Result<String, String> {
+    let mut accumulated = String::new();
+    let mut final_text = None;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("codex app-server timed out".into());
+        }
+
+        let line = rx
+            .recv_timeout(deadline.saturating_duration_since(now))
+            .map_err(|_| "codex app-server timed out".to_string())?;
+        let value: Value =
+            serde_json::from_str(&line).map_err(|e| format!("invalid app-server json: {e}"))?;
+
+        if let Some(text) = text_from_codex_notification(&value, turn_id, &mut accumulated) {
+            final_text = Some(text);
+        }
+
+        if value.get("method").and_then(Value::as_str) == Some("turn/completed")
+            && value
+                .get("params")
+                .and_then(|params| params.get("turn"))
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                == Some(turn_id)
+        {
+            return final_text
+                .or_else(|| (!accumulated.trim().is_empty()).then_some(accumulated))
+                .ok_or_else(|| "codex app-server completed without an agent message".to_string());
+        }
+
+        if value.get("method").and_then(Value::as_str) == Some("error") {
+            return Err(format!("codex app-server notification error: {value}"));
+        }
+
+        reject_server_request(stdin, &value)?;
+    }
+}
+
+fn parse_transform_response_text(text: &str) -> Result<TransformResponse, String> {
+    let trimmed = text.trim();
+    serde_json::from_str(trimmed)
+        .or_else(|_| {
+            let start = trimmed.find('{').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing json object",
+                ))
+            })?;
+            let end = trimmed.rfind('}').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing json object",
+                ))
+            })?;
+            serde_json::from_str(&trimmed[start..=end])
+        })
+        .map_err(|e| format!("invalid codex transform json: {e}; text={trimmed:?}"))
+}
+
+fn infer_with_codex_app_server(
+    config: &AppConfig,
+    base: &std::path::Path,
+    request: &TransformRequest,
+) -> Result<TransformResponse, String> {
+    let workdir = base.join("codex-workdir");
+    fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
+
+    let child = Command::new(&config.codex_command)
+        .args(&config.codex_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start codex app-server: {e}"))?;
+    let mut child = ChildCleanup::new(child);
+
+    let stdout = child
+        .child_mut()?
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open codex app-server stdout".to_string())?;
+    let mut stdin = child
+        .child_mut()?
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open codex app-server stdin".to_string())?;
+    let rx = start_stdout_reader(stdout);
+    let deadline = Instant::now() + Duration::from_millis(config.codex_timeout_ms.max(1_000));
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "romajiagent",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false,
+                "optOutNotificationMethods": []
+            }
+        }
+    });
+    write_json_rpc_line(&mut stdin, &initialize)?;
+    recv_json_until(&rx, deadline, &mut stdin, 1)?;
+
+    let mut thread_params = serde_json::json!({
+        "ephemeral": true,
+        "cwd": workdir.display().to_string(),
+        "runtimeWorkspaceRoots": [],
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "baseInstructions": "You are a Japanese text conversion service for Romaji Agent. Never use tools, shell commands, file reads, or network browsing. Return only valid JSON for the requested schema."
+    });
+    if let Some(model) = config
+        .codex_model
+        .as_ref()
+        .filter(|model| !model.is_empty())
+    {
+        thread_params["model"] = Value::String(model.clone());
+    }
+    let thread_start = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "thread/start",
+        "params": thread_params
+    });
+    write_json_rpc_line(&mut stdin, &thread_start)?;
+    let thread_result = recv_json_until(&rx, deadline, &mut stdin, 2)?;
+    let thread_id = thread_result
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("thread/start did not return a thread id: {thread_result}"))?;
+
+    let turn_start = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "turn/start",
+        "params": {
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": codex_prompt(request),
+                "text_elements": []
+            }],
+            "outputSchema": transform_response_schema()
+        }
+    });
+    write_json_rpc_line(&mut stdin, &turn_start)?;
+    let turn_result = recv_json_until(&rx, deadline, &mut stdin, 3)?;
+    let turn_id = turn_result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("turn/start did not return a turn id: {turn_result}"))?
+        .to_string();
+
+    let text = wait_for_codex_turn(&rx, deadline, &mut stdin, &turn_id)?;
+    parse_transform_response_text(&text)
+}
+
+fn infer_with_config(
+    config: &AppConfig,
+    base: &std::path::Path,
+    request: &TransformRequest,
+) -> Result<TransformResponse, String> {
+    match Backend::parse(&config.backend) {
+        Backend::Sidecar => infer_with_sidecar(config, request),
+        Backend::CodexAppServer => infer_with_codex_app_server(config, base, request),
+        Backend::Fallback => Err("fallback backend selected".into()),
+    }
+}
+
 fn save_transform(base: &PathBuf, result: &TransformResult, accepted: bool) -> Result<(), String> {
     let conn = Connection::open(base.join("db.sqlite")).map_err(|e| e.to_string())?;
     conn.execute(
@@ -369,7 +736,7 @@ fn transform_text(raw: String) -> Result<TransformResult, String> {
     };
 
     let infer_started = Instant::now();
-    let response = infer_with_sidecar(&config, &request)
+    let response = infer_with_config(&config, &base, &request)
         .unwrap_or_else(|_| fallback_convert(&normalized, &memory));
     let infer_ms = infer_started.elapsed().as_millis();
 
@@ -488,12 +855,116 @@ mod tests {
         let config = AppConfig {
             sidecar_command: Some("/path/to/sidecar".into()),
             sidecar_args: vec!["--model".into(), "/path/to/model.gguf".into()],
+            backend: "codex_app_server".into(),
             ..Default::default()
         };
         let text = toml::to_string(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.shortcut_macos, "Cmd+Shift+J");
+        assert_eq!(Backend::parse(&parsed.backend), Backend::CodexAppServer);
         assert_eq!(parsed.sidecar_args.len(), 2);
+    }
+
+    #[test]
+    fn legacy_config_uses_new_defaults() {
+        let text = r#"
+shortcut_macos = "Cmd+Shift+K"
+shortcut_other = "Ctrl+Shift+K"
+sidecar_command = "/path/to/sidecar"
+sidecar_args = ["--temperature", "0.1"]
+model_path = "/path/to/model.gguf"
+"#;
+        let parsed: AppConfig = toml::from_str(text).unwrap();
+        assert_eq!(parsed.shortcut_macos, "Cmd+Shift+K");
+        assert_eq!(parsed.sidecar_command.as_deref(), Some("/path/to/sidecar"));
+        assert_eq!(parsed.backend, "sidecar");
+        assert_eq!(parsed.codex_command, "codex");
+        assert_eq!(parsed.codex_args, vec!["app-server"]);
+    }
+
+    #[test]
+    fn backend_parses_aliases() {
+        assert_eq!(Backend::parse("codex"), Backend::CodexAppServer);
+        assert_eq!(Backend::parse("codex-app-server"), Backend::CodexAppServer);
+        assert_eq!(Backend::parse("fallback"), Backend::Fallback);
+        assert_eq!(Backend::parse("sidecar"), Backend::Sidecar);
+    }
+
+    #[test]
+    fn parses_codex_agent_message_notification() {
+        let mut accumulated = String::new();
+        let delta = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "itemId": "item",
+                "delta": "{\"converted\":\"今日\""
+            }
+        });
+        assert!(text_from_codex_notification(&delta, "turn", &mut accumulated).is_none());
+        assert_eq!(accumulated, "{\"converted\":\"今日\"");
+
+        let completed = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 0,
+                "item": {
+                    "type": "agentMessage",
+                    "id": "item",
+                    "text": "{\"converted\":\"今日\",\"refined\":\"今日はよい天気です。\",\"confidence\":0.9}",
+                    "phase": null,
+                    "memoryCitation": null
+                }
+            }
+        });
+
+        let text = text_from_codex_notification(&completed, "turn", &mut accumulated).unwrap();
+        let response = parse_transform_response_text(&text).unwrap();
+        assert_eq!(response.converted, "今日");
+        assert_eq!(response.refined, "今日はよい天気です。");
+    }
+
+    #[test]
+    fn rejects_codex_server_request_but_ignores_notifications() {
+        let mut output = Vec::new();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "exec/approval",
+            "params": {}
+        });
+        reject_server_request(&mut output, &request).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["id"], 42);
+        assert_eq!(response["error"]["code"], -32601);
+
+        output.clear();
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {}
+        });
+        reject_server_request(&mut output, &notification).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn parses_transform_response_from_wrapped_text() {
+        let response = parse_transform_response_text(
+            r#"Here is the JSON:
+{"converted":"明日","refined":"明日です。","confidence":0.8}
+Done."#,
+        )
+        .unwrap();
+
+        assert_eq!(response.converted, "明日");
+        assert_eq!(response.refined, "明日です。");
+        assert_eq!(response.confidence, 0.8);
     }
 
     #[test]

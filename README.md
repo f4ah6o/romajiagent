@@ -27,11 +27,43 @@ The app creates:
     lfm/
 ```
 
-## Sidecar Contract
+## Backends
+
+`~/.romaji-agent/config.toml` selects the conversion backend:
+
+```toml
+backend = "sidecar" # "sidecar", "codex_app_server", or "fallback"
+```
+
+`fallback` uses only deterministic terminology replacement from `memory.md`.
+
+### Codex App Server Backend
+
+To use Codex App Server as the backend, install and authenticate the Codex CLI,
+then configure:
+
+```toml
+backend = "codex_app_server"
+codex_command = "codex"
+codex_args = ["app-server"]
+codex_model = "gpt-5.5" # optional; omit or set null to use the Codex default
+codex_timeout_ms = 90000
+```
+
+Romaji Agent starts `codex app-server` over stdio for each transform, creates an
+ephemeral thread with `approvalPolicy = "never"` and a read-only sandbox, and
+asks for a JSON response matching the app's transform schema. If the selected
+backend fails or times out, the app falls back to deterministic conversion.
+
+See the official Codex App Server documentation:
+<https://developers.openai.com/codex/app-server>
+
+### Sidecar Contract
 
 Configure the sidecar in `~/.romaji-agent/config.toml`:
 
 ```toml
+backend = "sidecar"
 sidecar_command = "/path/to/romaji-agent-lfm-sidecar"
 sidecar_args = ["--max-tokens", "256", "--temperature", "0.1"]
 model_path = "/path/to/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf"
