@@ -15,6 +15,8 @@ pub struct TransformRequest {
     pub raw: String,
     pub memory: String,
     pub context: TransformContext,
+    #[serde(default)]
+    pub kana_candidate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

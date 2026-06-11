@@ -390,6 +390,7 @@ mod tests {
                 process_id: None,
                 window_title: None,
             },
+            kana_candidate: Some("きょう mtg".into()),
         };
 
         let prompt = build_prompt(&request);

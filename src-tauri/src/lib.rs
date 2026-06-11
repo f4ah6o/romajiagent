@@ -18,8 +18,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
 
+pub mod normalization;
 pub mod protocol;
 
+use normalization::normalize_input;
 use protocol::{TransformContext, TransformRequest, TransformResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,15 +74,17 @@ impl Backend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransformResult {
-    id: String,
-    raw: String,
-    converted: String,
-    refined: String,
-    final_text: String,
-    confidence: f32,
-    timings_ms: StageTimings,
-    context: TransformContext,
+pub struct TransformResult {
+    pub id: String,
+    pub raw: String,
+    pub normalized_raw: String,
+    pub kana_candidate: String,
+    pub converted: String,
+    pub refined: String,
+    pub final_text: String,
+    pub confidence: f32,
+    pub timings_ms: StageTimings,
+    pub context: TransformContext,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,10 +95,10 @@ struct AcceptOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct StageTimings {
-    normalize: u128,
-    convert_refine: u128,
-    full_roundtrip: u128,
+pub struct StageTimings {
+    pub normalize: u128,
+    pub convert_refine: u128,
+    pub full_roundtrip: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,10 +181,6 @@ fn init_db(base: &PathBuf) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-fn normalize(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn context_now() -> TransformContext {
@@ -275,23 +275,33 @@ fn infer_with_sidecar(
 }
 
 fn codex_prompt(request: &TransformRequest) -> String {
+    let kana_section = request
+        .kana_candidate
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\nKana candidate:\n{value}\n"))
+        .unwrap_or_default();
     format!(
         r#"Convert the following romaji, typo-heavy, or unconverted Japanese draft into natural Japanese.
 
 Rules:
 - Return only one JSON object matching this schema: {{"converted": string, "refined": string, "confidence": number}}.
 - Do not use tools, shell commands, file reads, or network browsing.
-- Preserve intended meaning. Use memory terms when they clearly apply.
+- Treat Raw as typed romaji input, not a free semantic prompt.
+- Prefer the Kana candidate as the phonetic anchor when it is present.
+- Preserve intended meaning from the phonetic input. Use memory terms when they clearly apply.
 - "converted" may be a direct conversion. "refined" should be natural, polished Japanese.
 - "confidence" must be between 0 and 1.
 
 Raw:
 {raw}
+{kana_section}
 
 Memory:
 {memory}
 "#,
         raw = request.raw,
+        kana_section = kana_section,
         memory = request.memory
     )
 }
@@ -625,7 +635,7 @@ fn save_transform(base: &PathBuf, result: &TransformResult, accepted: bool) -> R
             result.context.app_name,
             result.context.process_id,
             result.context.window_title,
-            result.raw,
+            result.normalized_raw,
             result.converted,
             result.refined,
             result.final_text,
@@ -718,30 +728,37 @@ fn app_paths() -> Result<PathsDto, String> {
     })
 }
 
-fn do_transform(raw: &str) -> Result<TransformResult, String> {
+pub fn do_transform(raw: &str) -> Result<TransformResult, String> {
+    do_transform_with_save(raw, false)
+}
+
+pub fn do_transform_with_save(raw: &str, save_preview: bool) -> Result<TransformResult, String> {
     let started = Instant::now();
     let base = ensure_layout()?;
     let config = load_config(&base);
     let memory = fs::read_to_string(base.join("memory.md")).unwrap_or_default();
 
     let normalize_started = Instant::now();
-    let normalized = normalize(raw);
+    let normalized = normalize_input(raw);
     let normalize_ms = normalize_started.elapsed().as_millis();
 
     let request = TransformRequest {
-        raw: normalized.clone(),
+        raw: normalized.normalized_raw.clone(),
         memory: memory.clone(),
         context: context_now(),
+        kana_candidate: Some(normalized.kana_candidate.clone()),
     };
 
     let infer_started = Instant::now();
     let response = infer_with_config(&config, &base, &request)
-        .unwrap_or_else(|_| fallback_convert(&normalized, &memory));
+        .unwrap_or_else(|_| fallback_convert(&normalized.normalized_raw, &memory));
     let infer_ms = infer_started.elapsed().as_millis();
 
-    Ok(TransformResult {
+    let result = TransformResult {
         id: Uuid::new_v4().to_string(),
-        raw: normalized,
+        raw: normalized.raw,
+        normalized_raw: normalized.normalized_raw,
+        kana_candidate: normalized.kana_candidate,
         converted: response.converted.clone(),
         refined: response.refined.clone(),
         final_text: response.refined,
@@ -752,15 +769,18 @@ fn do_transform(raw: &str) -> Result<TransformResult, String> {
             full_roundtrip: started.elapsed().as_millis(),
         },
         context: request.context,
-    })
+    };
+
+    if save_preview {
+        save_transform(&base, &result, false)?;
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
 fn transform_text(raw: String) -> Result<TransformResult, String> {
-    let result = do_transform(&raw)?;
-    let base = ensure_layout()?;
-    save_transform(&base, &result, false)?;
-    Ok(result)
+    do_transform_with_save(&raw, true)
 }
 
 #[tauri::command]
@@ -848,7 +868,7 @@ mod tests {
     #[test]
     fn normalize_collapses_whitespace() {
         assert_eq!(
-            normalize("  kyou   mtg\tde\nhanasita todo  "),
+            normalization::normalize_whitespace("  kyou   mtg\tde\nhanasita todo  "),
             "kyou mtg de hanasita todo"
         );
     }

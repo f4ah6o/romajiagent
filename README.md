@@ -72,6 +72,36 @@ model_path = "/path/to/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf"
 `model_path` is passed to the sidecar as `--model` unless `sidecar_args`
 already contains `--model` or `--model=...`.
 
+### Apple Foundation Models Sidecar
+
+On macOS 26+ with Apple Intelligence enabled, Romaji Agent can use Apple's
+on-device Foundation Models through the `ringo-fm` crates.io package:
+
+- <https://crates.io/crates/ringo-fm/0.1.0>
+- <https://crates.io/crates/ringo-fm-sys/0.1.0>
+
+Build the Apple Foundation Models sidecar:
+
+```bash
+cd src-tauri
+cargo build --bin romaji-agent-apple-fm-sidecar --release
+```
+
+Configure Romaji Agent to use it:
+
+```toml
+backend = "sidecar"
+sidecar_command = "/path/to/romaji-agent-apple-fm-sidecar"
+sidecar_args = ["--max-tokens", "256", "--temperature", "0.1"]
+```
+
+Run it directly for a contract smoke test:
+
+```bash
+printf '%s\n' '{"raw":"kyou mtg de hanasita todo","memory":"mtg -> ミーティング\ntodo -> TODO","context":{"timestamp":"2026-06-08T00:00:00Z","os":"macos","app_name":null,"process_id":null,"window_title":null}}' \
+  | ./target/release/romaji-agent-apple-fm-sidecar
+```
+
 The app sends one JSON request line:
 
 ```json
@@ -127,6 +157,37 @@ pnpm lint
 pnpm format
 cd src-tauri && cargo test
 ```
+
+## CLI
+
+Build the CLI:
+
+```bash
+cd src-tauri
+cargo build --bin romaji-agent-cli
+```
+
+Inspect the deterministic romaji-to-kana candidate:
+
+```bash
+./target/debug/romaji-agent-cli kana "konoguraino kakikata anara dou??"
+```
+
+Run the same transform path as the app, using `~/.romaji-agent/config.toml`:
+
+```bash
+./target/debug/romaji-agent-cli transform "konoguraino kakikata anara dou??"
+```
+
+For evaluation loops, read one input per line and emit JSONL:
+
+```bash
+printf '%s\n' "konoguraino kakikata anara dou??" "kyou mtg de hanasita todo" \
+  | ./target/debug/romaji-agent-cli transform --stdin
+```
+
+CLI transforms do not write preview rows to SQLite unless `--save` is passed.
+Use `--text` for quick human-readable output.
 
 ## Ubuntu 24.04 Debian Package
 

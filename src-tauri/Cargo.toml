@@ -19,6 +19,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "romaji-agent-lfm-sidecar"
 path = "src/bin/romaji-agent-lfm-sidecar.rs"
 
+[[bin]]
+name = "romaji-agent-apple-fm-sidecar"
+path = "src/bin/romaji-agent-apple-fm-sidecar.rs"
+
+[[bin]]
+name = "romaji-agent-cli"
+path = "src/bin/romaji-agent-cli.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -36,9 +44,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 encoding_rs = "0.8"
+wana_kana = "5.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 llama-cpp-2 = { version = "0.1.146", features = ["metal"] }
+ringo-fm = "0.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 llama-cpp-2 = "0.1.146"
