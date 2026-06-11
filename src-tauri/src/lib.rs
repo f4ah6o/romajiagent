@@ -718,15 +718,14 @@ fn app_paths() -> Result<PathsDto, String> {
     })
 }
 
-#[tauri::command]
-fn transform_text(raw: String) -> Result<TransformResult, String> {
+fn do_transform(raw: &str) -> Result<TransformResult, String> {
     let started = Instant::now();
     let base = ensure_layout()?;
     let config = load_config(&base);
     let memory = fs::read_to_string(base.join("memory.md")).unwrap_or_default();
 
     let normalize_started = Instant::now();
-    let normalized = normalize(&raw);
+    let normalized = normalize(raw);
     let normalize_ms = normalize_started.elapsed().as_millis();
 
     let request = TransformRequest {
@@ -740,7 +739,7 @@ fn transform_text(raw: String) -> Result<TransformResult, String> {
         .unwrap_or_else(|_| fallback_convert(&normalized, &memory));
     let infer_ms = infer_started.elapsed().as_millis();
 
-    let result = TransformResult {
+    Ok(TransformResult {
         id: Uuid::new_v4().to_string(),
         raw: normalized,
         converted: response.converted.clone(),
@@ -753,9 +752,20 @@ fn transform_text(raw: String) -> Result<TransformResult, String> {
             full_roundtrip: started.elapsed().as_millis(),
         },
         context: request.context,
-    };
+    })
+}
+
+#[tauri::command]
+fn transform_text(raw: String) -> Result<TransformResult, String> {
+    let result = do_transform(&raw)?;
+    let base = ensure_layout()?;
     save_transform(&base, &result, false)?;
     Ok(result)
+}
+
+#[tauri::command]
+fn preview_text(raw: String) -> Result<TransformResult, String> {
+    do_transform(&raw)
 }
 
 #[tauri::command]
@@ -823,6 +833,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_paths,
             transform_text,
+            preview_text,
             accept_transform,
             transform_clipboard_selection
         ])

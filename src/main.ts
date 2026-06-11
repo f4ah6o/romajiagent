@@ -80,9 +80,23 @@ const selectionButton = document.querySelector<HTMLButtonElement>("#selection")!
 let result: TransformResult | null = null;
 let mode: OutputMode = "refined";
 let converting = false;
+let debounceTimer: number | null = null;
+let lastAutoInput: string | null = null;
 
 function setStatus(value: string) {
   statusText.textContent = value;
+}
+
+function setStale(stale: boolean) {
+  converted.classList.toggle("stale", stale);
+  refined.classList.toggle("stale", stale);
+}
+
+function cancelDebounce() {
+  if (debounceTimer !== null) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
 }
 
 function setMode(next: OutputMode) {
@@ -108,8 +122,11 @@ async function convertFromInput() {
   const input = raw.value.trim();
   if (!input || converting) return;
 
+  cancelDebounce();
+
   converting = true;
   convertButton.disabled = true;
+  setStale(true);
   setStatus("Converting");
   try {
     result = await invoke<TransformResult>("transform_text", { raw: input });
@@ -118,11 +135,49 @@ async function convertFromInput() {
     timing.textContent = `${result.timings_ms.full_roundtrip}ms`;
     setStatus(`confidence ${result.confidence.toFixed(2)}`);
     setMode("refined");
+    lastAutoInput = input;
   } catch (error) {
     setStatus(String(error));
   } finally {
     converting = false;
     convertButton.disabled = false;
+    setStale(false);
+  }
+}
+
+async function autoConvert() {
+  const input = raw.value.trim();
+  if (!input || input === lastAutoInput) return;
+
+  if (converting) return;
+
+  converting = true;
+  convertButton.disabled = true;
+  setStale(true);
+  setStatus("Converting...");
+  const sentInput = input;
+  try {
+    const previewResult = await invoke<TransformResult>("preview_text", { raw: sentInput });
+    if (raw.value.trim() === sentInput || raw.value.trim().startsWith(sentInput)) {
+      result = previewResult;
+      converted.textContent = previewResult.converted;
+      refined.textContent = previewResult.refined;
+      timing.textContent = `${previewResult.timings_ms.full_roundtrip}ms`;
+      setStatus(`confidence ${previewResult.confidence.toFixed(2)}`);
+      setMode("refined");
+      lastAutoInput = sentInput;
+    }
+  } catch (error) {
+    setStatus(String(error));
+  } finally {
+    converting = false;
+    convertButton.disabled = false;
+    setStale(false);
+  }
+
+  const freshInput = raw.value.trim();
+  if (freshInput && freshInput !== lastAutoInput) {
+    await autoConvert();
   }
 }
 
@@ -177,11 +232,24 @@ document.querySelector("#pick-converted")?.addEventListener("click", () => setMo
 document.querySelector("#pick-refined")?.addEventListener("click", () => setMode("refined"));
 
 raw.addEventListener("input", () => {
-  result = null;
-  converted.textContent = "";
-  refined.textContent = "";
-  timing.textContent = "";
-  setStatus("Ready");
+  cancelDebounce();
+
+  const input = raw.value.trim();
+  if (!input) {
+    result = null;
+    converted.textContent = "";
+    refined.textContent = "";
+    timing.textContent = "";
+    lastAutoInput = null;
+    setStale(false);
+    setStatus("Ready");
+    return;
+  }
+
+  debounceTimer = window.setTimeout(() => {
+    debounceTimer = null;
+    autoConvert();
+  }, 500);
 });
 
 window.addEventListener("keydown", async (event) => {
@@ -197,7 +265,7 @@ window.addEventListener("keydown", async (event) => {
   }
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    await accept(true);
+    await accept(false);
   }
 });
 

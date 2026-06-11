@@ -206,33 +206,57 @@ fn infer(
             .context("decoding generated token")?;
 
         if generated.contains('}') && generated.contains("\"refined\"") {
-            if parse_response(&generated).is_ok() {
+            let full = format!(r#"{{"converted":"{generated}"#);
+            if parse_response(&full).is_ok() {
                 break;
             }
         }
     }
 
-    parse_response(&generated)
-        .or_else(|_| repair_response(&generated))
-        .with_context(|| format!("model did not emit valid response JSON: {generated:?}"))
+    let full_json = format!(r#"{{"converted":"{generated}"#);
+    parse_response(&full_json)
+        .or_else(|_| repair_response(&full_json))
+        .with_context(|| format!("model did not emit valid response JSON: {full_json:?}"))
+}
+
+fn filter_memory(memory: &str, raw: &str) -> String {
+    let raw_lower = raw.to_lowercase();
+    memory
+        .lines()
+        .filter(|line| {
+            if let Some((before, _)) = line.split_once("->") {
+                let key = before.trim().to_lowercase();
+                !key.is_empty() && raw_lower.contains(&key)
+            } else {
+                false
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn build_prompt(request: &TransformRequest) -> String {
+    let relevant = filter_memory(&request.memory, &request.raw);
+    let memory_section = if relevant.is_empty() {
+        String::new()
+    } else {
+        format!("\nREPLACE: {relevant}\n")
+    };
     format!(
-        r#"You are Romaji Agent, a local Japanese input assistant.
-Convert typo-heavy romaji, mixed Japanese, or unconverted input into natural Japanese.
-Respect terminology mappings and style notes from MEMORY.
-Return only compact JSON with these keys: converted, refined, confidence.
-Do not wrap the JSON in markdown.
+        r#"<|startoftext|>Romaji to Japanese. Each romaji word maps to one Japanese word. Convert every word faithfully.
+{memory_section}
+INPUT: sumimasen chotto okuremasu
+OUTPUT: {{"converted":"すみませんちょっと遅れます","refined":"すみません、ちょっと遅れます。","confidence":0.95}}
 
-MEMORY:
-{memory}
+INPUT: ashita made ni repo wo dasanakya
+OUTPUT: {{"converted":"明日までにレポを出さなきゃ","refined":"明日までにレポを出さなきゃ。","confidence":0.9}}
 
-INPUT:
-{raw}
+INPUT: kyou no kaigi de shiryou wo kakunin shita
+OUTPUT: {{"converted":"今日の会議で資料を確認した","refined":"今日の会議で資料を確認した。","confidence":0.95}}
 
-JSON:"#,
-        memory = request.memory,
+INPUT: {raw}
+OUTPUT: {{"converted":""#,
+        memory_section = memory_section,
         raw = request.raw
     )
 }

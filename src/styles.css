@@ -144,6 +144,11 @@ output {
   white-space: pre-wrap;
   padding: 10px;
   line-height: 1.45;
+  transition: opacity 0.15s ease;
+}
+
+output.stale {
+  opacity: 0.5;
 }
 
 .result.selected {
